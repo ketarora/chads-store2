@@ -138,12 +138,12 @@ export const useDatabase = () => {
     date?: string,
   }) => {
     if (!user) return null;
-    const orderId = `VT-${Math.floor(100000 + Math.random() * 900000)}`;
+    const orderId = `VT-${Math.floor(100000 + Math.random() * 900000)}`; // This is the internal order_id
     const { data: order, error: orderError } = await supabase
       .from('orders')
       .insert({
         user_id: user.id,
-        order_id: orderId,
+        order_id: orderId, // Save the generated VT-xxxxxx ID
         total_amount: orderDetails.total,
         subtotal: orderDetails.subtotal,
         gst_amount: orderDetails.gst,
@@ -160,6 +160,7 @@ export const useDatabase = () => {
       })
       .select()
       .single();
+
     if (orderError) {
       toast({
         title: "Error",
@@ -169,18 +170,22 @@ export const useDatabase = () => {
       console.error('Supabase order creation error:', orderError);
       return null;
     }
+
     // Create order items
-    const orderItems = cartItems.map(item => ({
-      order_id: order.id,
+    const orderItemsData = cartItems.map(item => ({ // Renamed to avoid conflict
+      order_id: order.id, // This is the UUID from Supabase for the 'orders' table row
       product_id: item.product_id,
       product_name: item.product_name,
       product_price: item.product_price,
       quantity: item.quantity,
-      total_price: item.product_price * item.quantity
+      total_price: item.product_price * item.quantity,
+      internal_order_id: orderId // Store the VT-xxxxxx ID here too if needed, or rely on joining with 'orders' table
     }));
+
     const { error: itemsError } = await supabase
       .from('order_items')
-      .insert(orderItems);
+      .insert(orderItemsData);
+
     if (itemsError) {
       toast({
         title: "Error",
@@ -188,14 +193,55 @@ export const useDatabase = () => {
         variant: "destructive"
       })
       console.error('Supabase order items creation error:', itemsError);
+      // Potentially delete the order record if items fail to be created
+      await supabase.from('orders').delete().eq('id', order.id);
       return null
     }
 
     // Clear cart after successful order
-    await clearCartDB()
+    // await clearCartDB() // This might be called by the client instead after payment
 
-    return order
+    return { ...order, internal_order_id: orderId }; // Return the Supabase order object AND our internal_order_id
   }
+
+  // New function to update order status and payment ID
+  const updateOrderStatusAndPayment = async (internalOrderId: string, paymentId: string, newStatus: string) => {
+    if (!internalOrderId) {
+      console.error('Internal Order ID is required to update order status.');
+      toast({
+        title: "Error",
+        description: "Internal Order ID is missing. Cannot update order.",
+        variant: "destructive"
+      });
+      return null;
+    }
+
+    console.log(`Updating order ${internalOrderId} with paymentId ${paymentId} to status ${newStatus}`);
+
+    const { data, error } = await supabase
+      .from('orders')
+      .update({
+        status: newStatus,
+        transaction_id: paymentId,
+        updated_at: new Date().toISOString()
+      })
+      .eq('order_id', internalOrderId) // Use 'order_id' which stores "VT-xxxxxx"
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error updating order status:', error);
+      toast({
+        title: "Database Error",
+        description: "Failed to update order status in the database.",
+        variant: "destructive"
+      });
+      return null;
+    }
+
+    console.log('Order status updated successfully:', data);
+    return data;
+  };
 
   return {
     addToCartDB,
@@ -203,6 +249,7 @@ export const useDatabase = () => {
     updateCartQuantity,
     removeFromCartDB,
     clearCartDB,
-    createOrder
+    createOrder,
+    updateOrderStatusAndPayment
   }
 }

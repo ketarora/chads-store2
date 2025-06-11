@@ -45,11 +45,19 @@ const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
       }
       onClose();
     } catch (error: any) {
-      toast({
-        title: "Error",
-        description: error.message,
-        variant: "destructive",
-      });
+      if (error.message === "creditmail not found") {
+        toast({
+          title: "Login Failed",
+          description: "Invalid login credentials. Please check your email and password and try again.",
+          variant: "destructive",
+        });
+      } else {
+        toast({
+          title: "Error",
+          description: error.message,
+          variant: "destructive",
+        });
+      }
     } finally {
       setLoading(false);
     }

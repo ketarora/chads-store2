@@ -31,12 +31,12 @@ const Cart = ({ isOpen, onClose }: CartProps) => {
     getTotal,
     addToCart
   } = useCart();
-  const { createOrder } = useDatabase();
+  const { createOrder, updateOrderStatusAndPayment } = useDatabase(); // Added updateOrderStatusAndPayment
   const { user } = useAuth();
   
-  const [isPaying, setIsPaying] = useState(false);
-  const [order, setOrder] = useState<any>(null);
-  const [orderId, setOrderId] = useState('');
+  const [isPaying, setIsPaying] = useState(false); // Used for UPI's handleConfirmProceed
+  const [order, setOrder] = useState<any>(null); // Stores the full order object from Supabase if needed
+  const [currentInternalOrderId, setCurrentInternalOrderId] = useState(''); // Renamed for clarity, stores "VT-xxxxxx"
   const [showPaymentSummary, setShowPaymentSummary] = useState(false);
   const [showPaymentMethod, setShowPaymentMethod] = useState(false);
   const [paymentMethod, setPaymentMethod] = useState<string | null>(null);
@@ -61,14 +61,217 @@ const Cart = ({ isOpen, onClose }: CartProps) => {
       return;
     }
     // Directly proceed to UPI payment confirmation
-    setPaymentMethod('UPI');
-    setConfirmMessage("Do you want to proceed with UPI payment?");
-    setShowConfirm(true);
+    // setPaymentMethod('UPI');
+    // setConfirmMessage("Do you want to proceed with UPI payment?");
+    // setShowConfirm(true);
+    // NOW: Open the payment method modal
+    setShowPaymentMethod(true);
   };
 
-  const handlePaymentSelect = (method: string) => {
-    // This function is no longer needed as we only support UPI via direct checkout
-    // Keeping it empty or removing it
+  const handlePaymentSelect = async (method: string) => {
+    setShowPaymentMethod(false); // Close the modal first
+
+    if (method === 'card') {
+      setProcessingPayment(true);
+      toast({ title: "Initiating Card Payment", description: "Please wait..." });
+
+      try {
+        // 1. Create internal order first
+        const dbCartItemsForOrder = cartItems.map(item => ({ // Prepare items for createOrder
+          id: item.id,
+          user_id: user?.id || '',
+          product_id: item.id,
+          product_name: item.name,
+          product_price: item.price,
+          product_image: item.id === 'mystery-box' ? '/mystery-box-attached.jpg' : item.image,
+          product_category: item.category,
+          quantity: item.quantity,
+          created_at: new Date().toISOString(),
+        }));
+
+        const internalOrder = await createOrder(dbCartItemsForOrder, {
+          subtotal: getSubtotal(),
+          gst: getGST(),
+          total: getTotal(),
+          payment_method: 'Card (Razorpay)', // Indicate payment method
+          transaction_id: 'Pending Razorpay',   // Placeholder until payment is done
+          status: 'Pending Payment',       // Initial status
+          items: dbCartItemsForOrder.map(item => ({ // Simplified item structure for 'orders' table
+             id: item.product_id, name: item.product_name, quantity: item.quantity, price: item.product_price
+          })),
+          notes: customerNotes,
+          address: customerAddress,
+          pincode: customerPincode,
+          device: navigator.userAgent,
+          date: new Date().toISOString(),
+        });
+
+        if (!internalOrder || !internalOrder.internal_order_id) {
+          toast({ title: "Order Creation Failed", description: "Could not create an order in our system. Please try again.", variant: "destructive" });
+          setProcessingPayment(false);
+          return;
+        }
+        setCurrentInternalOrderId(internalOrder.internal_order_id); // Store our "VT-xxxxxx" ID
+        console.log('Internal Order Created:', internalOrder.internal_order_id);
+
+        // 2. Create Razorpay order
+        toast({ title: "Processing Card Payment", description: "Connecting to payment gateway..." });
+        const razorpayApiResponse = await fetch('/api/razorpay/createOrder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            amount: getTotal() * 100,
+            currency: 'INR',
+            receipt: internalOrder.internal_order_id // Pass internal order_id as receipt
+          }),
+        });
+        const razorpayOrderPayload = await razorpayApiResponse.json();
+        if (!razorpayApiResponse.ok) {
+          setProcessingPayment(false);
+          throw new Error(razorpayOrderPayload.error || 'Failed to create Razorpay order');
+        }
+        console.log('Razorpay Order Created:', razorpayOrderPayload);
+
+        const razorpayKeyId = import.meta.env.VITE_RAZORPAY_KEY_ID;
+        if (!razorpayKeyId) {
+          console.error('Razorpay Key ID is not defined in environment variables.');
+          toast({ title: "Configuration Error", description: "Razorpay payments are currently unavailable. Please try another method.", variant: "destructive" });
+          setProcessingPayment(false);
+          return;
+        }
+
+        if (!(window as any).Razorpay) {
+          console.error('Razorpay SDK not loaded.');
+          toast({ title: "Error", description: "Payment gateway failed to load. Please refresh and try again.", variant: "destructive" });
+          setProcessingPayment(false);
+          return;
+        }
+
+        const options = {
+          key: razorpayKeyId,
+          amount: razorpayOrderPayload.amount.toString(), // Amount is in currency subunits. Default currency is INR.
+          currency: razorpayOrderPayload.currency,
+          name: 'Glowsy Galaxy Shop',
+          description: `Payment for Order ID: ${internalOrder.internal_order_id}`,
+          order_id: razorpayOrderPayload.id,
+          handler: async function (rzpResponse: any) { // Made handler async
+            toast({ title: "Payment Submitted", description: "Verifying payment details..." });
+            // setProcessingPayment(true) should already be true and remain true
+
+            try {
+              const verificationResponse = await fetch('/api/razorpay/verifySignature', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  razorpay_order_id: rzpResponse.razorpay_order_id,
+                  razorpay_payment_id: rzpResponse.razorpay_payment_id,
+                  razorpay_signature: rzpResponse.razorpay_signature,
+                }),
+              });
+
+              const verificationResult = await verificationResponse.json();
+
+              if (verificationResult.verified) {
+                toast({ title: "Payment Verified!", description: "Updating your order status..." });
+
+                const updateResult = await updateOrderStatusAndPayment(
+                  internalOrder.internal_order_id, // Use the stored internal order ID
+                  rzpResponse.razorpay_payment_id,
+                  'Paid'
+                );
+
+                if (updateResult) {
+                  toast({ title: "Order Confirmed!", description: "Your order has been placed successfully." });
+                  clearCart();
+                  onClose(); // Close cart modal
+                  navigate(`/order-success?orderId=${internalOrder.internal_order_id}&paymentId=${rzpResponse.razorpay_payment_id}`);
+                } else {
+                  toast({ title: "Order Update Failed", description: "Payment verified, but failed to update order. Please contact support.", variant: "destructive" });
+                }
+              } else {
+                toast({ title: "Payment Verification Failed", description: verificationResult.error || "Signature mismatch. Please contact support.", variant: "destructive" });
+              }
+            } catch (verificationError: any) {
+              console.error('Error during payment verification or order update:', verificationError);
+              toast({ title: "Verification Process Error", description: "An error occurred during payment verification. Please contact support.", variant: "destructive" });
+            } finally {
+              setProcessingPayment(false); // Set processing to false after all steps in handler are done or if error
+            }
+          },
+          prefill: {
+            name: user?.user_metadata?.name || '',
+            email: user?.email || '',
+            contact: user?.phone || '',
+          },
+          notes: {
+            internal_order_id: internalOrder.internal_order_id,
+            customer_notes: customerNotes || '',
+          },
+          theme: {
+            color: '#4A00E0', // Example theme color
+          },
+          modal: {
+            ondismiss: function () {
+              console.log('Razorpay payment modal dismissed.');
+              toast({ title: "Payment Cancelled", description: "You cancelled the payment.", variant: "destructive" });
+              setProcessingPayment(false);
+            },
+          },
+        };
+
+        const rzp = new (window as any).Razorpay(options);
+
+        rzp.on('payment.failed', function (response: any) {
+          console.error('Razorpay payment failed:', response.error);
+          toast({
+            title: "Payment Failed",
+            description: `Error: ${response.error.description} (Reason: ${response.error.reason})`,
+            variant: "destructive",
+          });
+          setProcessingPayment(false);
+        });
+
+        rzp.open();
+
+      } catch (error: any) { // This catch is for the fetch to /api/razorpay/createOrder
+        console.error('Razorpay order creation API error:', error);
+        toast({ title: "Error", description: error.message, variant: "destructive" });
+        // setProcessingPayment(false) is already called if !response.ok,
+        // but if fetch itself fails (network error), it needs to be here too.
+        // However, the Razorpay modal logic now handles setProcessingPayment(false) on its own lifecycle.
+        // The primary setProcessingPayment(true) is at the start of 'card' method.
+        // If API fails before Razorpay SDK is invoked, we need to ensure it's reset.
+        // This catch is for the try block wrapping internal order creation and Razorpay order creation
+      } catch (error: any) {
+        console.error('Error during card payment pre-processing or Razorpay setup:', error);
+        toast({ title: "Payment Setup Error", description: error.message || "Could not initiate card payment.", variant: "destructive" });
+        setProcessingPayment(false); // Ensure processing is false if any setup step fails
+      }
+      // Note: The setProcessingPayment(false) that was in a finally block for the fetch to /api/razorpay/createOrder
+      // is now effectively handled by the new outer try/catch's finally in the handler,
+      // or by explicit setProcessingPayment(false) calls on error before rzp.open().
+    } else if (method === 'upi') {
+      setPaymentMethod('UPI');
+      // For UPI, we might also want to create the internal order before showing QR
+      // For consistency, let's try to create the order here as well.
+      // This assumes handleConfirmProceed will then use this orderId.
+      // This part is becoming complex, handleConfirmProceed also creates an order.
+      // For now, let's keep UPI as is, and focus on card payment's orderId.
+      // To do this properly, handleConfirmProceed would need to be refactored to accept an orderId
+      // or also use the setCurrentInternalOrderId pattern.
+      // For this subtask, the main goal is Razorpay flow.
+      setConfirmMessage("Do you want to proceed with UPI payment?");
+      setShowConfirm(true);
+    } else if (method === 'cod') {
+      console.log("Cash on Delivery selected");
+      toast({ title: "Cash on Delivery", description: "COD selected. Further implementation needed." });
+      // TODO: Implement COD logic (e.g. save order with COD status)
+      // For now, let's simulate creating an order for COD
+      // This part would typically involve calling createOrder with 'COD'
+      // and then navigating to a success page or showing a message.
+      // As a placeholder:
+      // onClose(); // Close cart
+    }
   };
 
   const handleConfirmProceed = async () => {
@@ -121,8 +324,8 @@ const Cart = ({ isOpen, onClose }: CartProps) => {
         }
 
         setOrder(order);
-        const createdOrderId = order?.order_id || '';
-        setOrderId(createdOrderId);
+        const createdOrderId = order?.internal_order_id || order?.order_id || ''; // Prioritize internal_order_id
+        setCurrentInternalOrderId(createdOrderId); // Ensure state is updated for UPI flow too if order is made here.
 
         // Redirect to the new payment page with order details
         navigate(`/payment?orderId=${createdOrderId}&amount=${getTotal()}`);
@@ -287,7 +490,7 @@ const Cart = ({ isOpen, onClose }: CartProps) => {
   return (
     <>
       <Dialog open={isOpen} onOpenChange={onClose}>
-        <DialogContent className="sm:max-w-md bg-white rounded-2xl shadow-2xl border-0">
+        <DialogContent className="sm:max-w-md bg-white rounded-2xl shadow-2xl border-0 p-6">
           <DialogHeader>
             <DialogTitle className="text-2xl font-bold flex items-center gap-2">
               <ShoppingBag className="h-5 w-5" /> 
@@ -295,54 +498,70 @@ const Cart = ({ isOpen, onClose }: CartProps) => {
             </DialogTitle>
           </DialogHeader>
           
-          {/* Customer Address and Notes */}
-          <div className="mb-4">
-            <label className="block text-sm font-medium text-gray-700 mb-1">Delivery Address</label>
-            <div className="mt-4">
-              <Label htmlFor="customer-address">Shipping Address</Label>
-              <Textarea
-                id="customer-address"
-                value={customerAddress}
-                onChange={(e) => setCustomerAddress(e.target.value)}
-                placeholder="Enter shipping address..."
-                rows={3}
-              />
-              <div className="mt-4">
-                <Label htmlFor="customer-pincode">Pincode</Label>
-                <Input
-                  id="customer-pincode"
-                  type="text"
-                  value={customerPincode}
-                  onChange={(e) => setCustomerPincode(e.target.value)}
-                  placeholder="Enter pincode..."
-                />
-                <button
-                  onClick={handlePincodeValidation}
-                  className="mt-2 text-brand-blue hover:underline text-sm"
-                  type="button"
-                >
-                  Validate Pincode
-                </button>
-                {pincodeCity && (
-                  <p className="mt-2 text-sm text-gray-600">City: {pincodeCity}</p>
-                )}
+          <div className="space-y-6 py-4"> {/* Added py-4 for vertical padding around this section */}
+            <div>
+              <h3 className="text-lg font-semibold mb-3 text-gray-800">Delivery Information</h3>
+              <div className="space-y-4">
+                <div>
+                  <Label htmlFor="customer-address" className="mb-1 block text-sm font-medium text-gray-700">Shipping Address</Label>
+                  <Textarea
+                    id="customer-address"
+                    value={customerAddress}
+                    onChange={(e) => setCustomerAddress(e.target.value)}
+                    placeholder="Enter your full shipping address..."
+                    rows={3}
+                    className="resize-none" // Added to prevent manual resize if not desired
+                  />
+                  <button
+                    onClick={() => getLocationAndSendToBackend(user?.id || 'anonymous')}
+                    className="mt-2 text-sm text-brand-blue hover:underline focus:outline-none focus:ring-2 focus:ring-brand-blue rounded"
+                    type="button"
+                  >
+                    Use My Current Location
+                  </button>
+                </div>
+                <div>
+                  <Label htmlFor="customer-pincode" className="mb-1 block text-sm font-medium text-gray-700">Pincode</Label>
+                  <div className="flex items-start gap-2"> {/* Changed to items-start for better alignment if button is taller */}
+                    <Input
+                      id="customer-pincode"
+                      type="text" // Keep as text to allow non-numeric if needed, validation handles digits
+                      value={customerPincode}
+                      onChange={(e) => setCustomerPincode(e.target.value)}
+                      placeholder="Enter 6-digit pincode"
+                      className="flex-grow"
+                      maxLength={6} // Added maxLength for pincode
+                    />
+                    <Button
+                      onClick={handlePincodeValidation}
+                      type="button"
+                      variant="outline"
+                      className="flex-shrink-0"
+                      disabled={processingPayment} // Assuming processingPayment might disable this
+                    >
+                      Validate
+                    </Button>
+                  </div>
+                  {pincodeCity && (
+                    <p className="mt-1 text-xs text-gray-500"> {/* Adjusted text size for pincode city */}
+                      {pincodeCity.startsWith("Verifying") ? pincodeCity : `Deliverable to: ${pincodeCity}`}
+                    </p>
+                  )}
+                </div>
               </div>
-              <button
-                onClick={() => getLocationAndSendToBackend(user?.id || 'anonymous')}
-                className="mt-2 text-brand-blue hover:underline text-sm"
-                type="button" // Prevent form submission if inside a form
-              >
-                Use My Current Location
-              </button>
             </div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Order Notes</label>
-            <textarea
-              className="w-full border rounded p-2"
-              rows={1}
-              value={customerNotes}
-              onChange={e => setCustomerNotes(e.target.value)}
-              placeholder="Any special instructions? (optional)"
-            />
+
+            <div className="pt-2"> {/* Added some top padding to separate from address */}
+              <Label htmlFor="customer-notes" className="mb-1 block text-sm font-medium text-gray-700">Order Notes <span className="text-xs text-gray-500">(Optional)</span></Label>
+              <Textarea
+                id="customer-notes" // Changed from customerNotes to customer-notes for consistency
+                value={customerNotes}
+                onChange={(e) => setCustomerNotes(e.target.value)}
+                placeholder="Any special instructions for your order?"
+                rows={2} // Reduced rows from 3 to 2 for notes
+                className="resize-none"
+              />
+            </div>
           </div>
           
           <div className="max-h-[60vh] overflow-y-auto py-4">
@@ -460,7 +679,7 @@ const Cart = ({ isOpen, onClose }: CartProps) => {
       <PaymentSummary 
         isOpen={showPaymentSummary}
         onClose={() => setShowPaymentSummary(false)}
-        orderId={orderId}
+        orderId={currentInternalOrderId} // Use currentInternalOrderId
         paymentMethod={paymentMethod || ''}
         purchasedItems={purchasedItems}
         transactionId={order?.transaction_id}
